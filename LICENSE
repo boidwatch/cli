@@ -1,0 +1,20 @@
+Copyright (c) 2026 Boidwatch. All rights reserved.
+
+The Boidwatch command-line interface ("Software") is proprietary software
+made available for use with the Boidwatch hosted service.
+
+Permission is granted to download, install, and run unmodified copies of the
+Software solely to interact with the Boidwatch service, subject to the
+Boidwatch Terms of Service at https://boidwatch.com/terms.
+
+You may not, except to the extent permitted by applicable law:
+  - reverse engineer, decompile, or disassemble the Software;
+  - redistribute, sublicense, sell, or rent the Software; or
+  - remove or alter any proprietary notices contained in the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+OR OTHER DEALINGS IN THE SOFTWARE.
