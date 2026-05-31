@@ -14,9 +14,6 @@ brew install boidwatch/tap/boidwatch
 
 # curl | sh (macOS / Linux). Pin a version with BOIDWATCH_VERSION=vX.Y.Z.
 curl -fsSL https://boidwatch.com/install.sh | sh
-
-# Docker
-docker run --rm -e BOIDWATCH_API_KEY ghcr.io/boidwatch/cli:latest version
 ```
 
 Windows: download the `.zip` from the [latest release](https://github.com/boidwatch/cli/releases/latest) and put `boidwatch.exe` on your `PATH`.
