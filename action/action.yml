@@ -1,0 +1,470 @@
+name: 'Boidwatch UX Check'
+description: >-
+  Run a Boidwatch persona-flock exploration against a URL (e.g. a preview
+  deploy), post the findings as a sticky PR comment, and optionally gate the
+  job on coarse assertions.
+author: 'Boidwatch'
+branding:
+  icon: 'eye'
+  color: 'blue'
+
+inputs:
+  url:
+    description: 'Page URL to explore (e.g. the preview-deploy URL).'
+    required: true
+  api-key:
+    description: 'Boidwatch API key. Pass from secrets, never inline.'
+    required: true
+  design-intent:
+    description: 'Design intent driving gap analysis (e.g. "Sign up for the newsletter").'
+    required: false
+    default: ''
+  mode:
+    description: >-
+      "comment" (default): never fail the job on findings — only on
+      auth/credits/infra errors. "gate": pass the assert-* inputs to the CLI
+      and fail the job when passed is not "true": an assertion failed (exit
+      code 9), no persona got past the entry URL, or gap analysis failed.
+    required: false
+    default: 'comment'
+  agents:
+    description: 'Number of personas to dispatch. Empty (default) keeps the --quick preset of 5 (~5 credits).'
+    required: false
+    default: ''
+  max-steps:
+    description: 'Maximum steps per persona. Empty (default) keeps the --quick preset of 15.'
+    required: false
+    default: ''
+  wait-timeout:
+    description: 'Maximum time to wait for the run (Go duration, e.g. 10m).'
+    required: false
+    default: '10m'
+  assert-max-high-gaps:
+    description: 'Gate mode only: fail if more than N high-severity gaps are found.'
+    required: false
+    default: ''
+  assert-min-valid-agents:
+    description: 'Gate mode only: fail if fewer than N agent sessions completed validly.'
+    required: false
+    default: ''
+  share-report:
+    description: 'Mint a public share link for the HTML report and include it in the PR comment.'
+    required: false
+    default: 'true'
+  github-token:
+    description: 'Token used for the PR comment and release-download API calls.'
+    required: false
+    default: ${{ github.token }}
+  version:
+    description: 'boidwatch CLI version to pin (release tag of boidwatch/cli, e.g. v0.4.2). Default: latest release.'
+    required: false
+    default: 'latest'
+  api-url:
+    description: 'Boidwatch API base URL.'
+    required: false
+    default: 'https://app.boidwatch.com'
+
+outputs:
+  run-id:
+    description: 'The Boidwatch run ID.'
+    value: ${{ steps.parse.outputs.run-id }}
+  report-url:
+    description: 'Public share-link URL for the HTML report (empty if share-report is false).'
+    value: ${{ steps.share.outputs.report-url }}
+  high-gaps:
+    description: 'Count of high-severity gaps found.'
+    value: ${{ steps.parse.outputs.high-gaps }}
+  valid-agents:
+    description: 'Number of agent sessions that completed validly.'
+    value: ${{ steps.parse.outputs.valid-agents }}
+  passed:
+    description: >-
+      "true" when the run completed, some persona got past the entry URL, gap
+      analysis did not fail, and (in gate mode) all assertions passed.
+    value: ${{ steps.parse.outputs.passed }}
+  entry-block:
+    description: 'Why no persona got past the entry URL (auth wall or anti-bot challenge). Empty when some persona did.'
+    value: ${{ steps.parse.outputs.entry-block }}
+  gap-analysis-status:
+    description: '"ok", "not_requested", or "failed" (design-intent was set but gap analysis produced nothing).'
+    value: ${{ steps.parse.outputs.gap-analysis-status }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Resolve CLI version and platform
+      id: resolve
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        BW_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "$RUNNER_OS" in
+          Linux)  os="linux" ;;
+          macOS)  os="darwin" ;;
+          *) echo "::error::Unsupported runner OS: $RUNNER_OS (boidwatch releases cover linux/darwin)"; exit 1 ;;
+        esac
+        case "$RUNNER_ARCH" in
+          X64)   arch="x86_64" ;;
+          ARM64) arch="arm64" ;;
+          *) echo "::error::Unsupported runner arch: $RUNNER_ARCH"; exit 1 ;;
+        esac
+        if [ "$BW_VERSION" = "latest" ]; then
+          tag=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/boidwatch/cli/releases/latest" | jq -r '.tag_name')
+        else
+          tag="$BW_VERSION"
+        fi
+        if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+          echo "::error::Could not resolve a boidwatch/cli release for version '$BW_VERSION'"
+          exit 1
+        fi
+        echo "tag=$tag"   >> "$GITHUB_OUTPUT"
+        echo "ver=${tag#v}" >> "$GITHUB_OUTPUT"
+        echo "os=$os"     >> "$GITHUB_OUTPUT"
+        echo "arch=$arch" >> "$GITHUB_OUTPUT"
+
+    - name: Cache boidwatch binary
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.boidwatch/bin
+        key: boidwatch-cli-${{ steps.resolve.outputs.tag }}-${{ steps.resolve.outputs.os }}-${{ steps.resolve.outputs.arch }}
+
+    - name: Download boidwatch binary
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        BW_TAG: ${{ steps.resolve.outputs.tag }}
+        BW_VER: ${{ steps.resolve.outputs.ver }}
+        BW_OS: ${{ steps.resolve.outputs.os }}
+        BW_ARCH: ${{ steps.resolve.outputs.arch }}
+      run: |
+        set -euo pipefail
+        # GoReleaser names archives boidwatch_<version>_<os>_<x86_64|arm64>.tar.gz.
+        asset="boidwatch_${BW_VER}_${BW_OS}_${BW_ARCH}.tar.gz"
+        tmp=$(mktemp -d)
+        base="https://github.com/boidwatch/cli/releases/download/$BW_TAG"
+        if ! curl -fsSL -o "$tmp/$asset" "$base/$asset"; then
+          echo "::error::No release asset $asset in boidwatch/cli@$BW_TAG"
+          exit 1
+        fi
+        if ! curl -fsSL -o "$tmp/checksums.txt" "$base/checksums.txt"; then
+          echo "::error::No checksums.txt in boidwatch/cli@$BW_TAG"
+          exit 1
+        fi
+        want=$(awk -v a="$asset" '$2 == a { print $1 }' "$tmp/checksums.txt")
+        if command -v sha256sum >/dev/null; then
+          got=$(sha256sum "$tmp/$asset" | awk '{ print $1 }')
+        else
+          got=$(shasum -a 256 "$tmp/$asset" | awk '{ print $1 }')
+        fi
+        if [ -z "$want" ] || [ "$got" != "$want" ]; then
+          echo "::error::Checksum mismatch for $asset in boidwatch/cli@$BW_TAG (want '$want', got '$got')"
+          exit 1
+        fi
+        tar -xzf "$tmp/$asset" -C "$tmp" boidwatch
+        mkdir -p "$HOME/.boidwatch/bin"
+        install -m 0755 "$tmp/boidwatch" "$HOME/.boidwatch/bin/boidwatch"
+
+    - name: Add boidwatch to PATH
+      shell: bash
+      run: echo "$HOME/.boidwatch/bin" >> "$GITHUB_PATH"
+
+    - name: Run Boidwatch exploration
+      id: run
+      shell: bash
+      env:
+        BOIDWATCH_API_KEY: ${{ inputs.api-key }}
+        BOIDWATCH_API_URL: ${{ inputs.api-url }}
+        BW_URL: ${{ inputs.url }}
+        BW_DESIGN_INTENT: ${{ inputs.design-intent }}
+        BW_MODE: ${{ inputs.mode }}
+        BW_AGENTS: ${{ inputs.agents }}
+        BW_MAX_STEPS: ${{ inputs.max-steps }}
+        BW_WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
+        BW_ASSERT_MAX_HIGH_GAPS: ${{ inputs.assert-max-high-gaps }}
+        BW_ASSERT_MIN_VALID_AGENTS: ${{ inputs.assert-min-valid-agents }}
+      run: |
+        set -uo pipefail
+        results="$RUNNER_TEMP/boidwatch-results.json"
+        errlog="$RUNNER_TEMP/boidwatch-stderr.log"
+
+        args=(run create --url "$BW_URL" --quick --wait --wait-timeout "$BW_WAIT_TIMEOUT")
+        if [ -n "$BW_DESIGN_INTENT" ]; then
+          args+=(--design-intent "$BW_DESIGN_INTENT")
+        fi
+        if [ -n "$BW_AGENTS" ]; then
+          args+=(--agents "$BW_AGENTS")
+        fi
+        if [ -n "$BW_MAX_STEPS" ]; then
+          args+=(--max-steps "$BW_MAX_STEPS")
+        fi
+        if [ "$BW_MODE" = "gate" ]; then
+          if [ -n "$BW_ASSERT_MAX_HIGH_GAPS" ]; then
+            args+=(--assert-max-high-gaps "$BW_ASSERT_MAX_HIGH_GAPS")
+          fi
+          if [ -n "$BW_ASSERT_MIN_VALID_AGENTS" ]; then
+            args+=(--assert-min-valid-agents "$BW_ASSERT_MIN_VALID_AGENTS")
+          fi
+        fi
+
+        set +e
+        boidwatch --json --quiet "${args[@]}" > "$results" 2> "$errlog"
+        ec=$?
+        set -e
+
+        echo "exit-code=$ec" >> "$GITHUB_OUTPUT"
+        echo "results-file=$results" >> "$GITHUB_OUTPUT"
+
+        # In --json mode the CLI writes its error envelope, with message and
+        # hint, as the last stderr line.
+        detail=""
+        if [ -s "$errlog" ]; then
+          detail=$(tail -n 1 "$errlog" | jq -r '[.error.message, .hint] | map(select(. != null and . != "")) | join(". ")' 2>/dev/null \
+            || tail -n 5 "$errlog")
+          detail=$(printf '%s' "$detail" | tr '\n' ' ')
+        fi
+
+        case "$ec" in
+          0|9)
+            # 9 = a check failed (assert-* in gate mode, or an entry block).
+            # The gate step fails the job after the PR comment is posted, so
+            # the report still lands on the PR.
+            ;;
+          1)
+            echo "::error title=Boidwatch run failed::Unexpected error, or the run ended without completing. $detail"
+            exit 1
+            ;;
+          2)
+            echo "::error title=Boidwatch rejected the inputs::Validation failed. Check the url (it must be publicly reachable) and the numeric inputs. $detail"
+            exit 2
+            ;;
+          3)
+            echo "::error title=Boidwatch auth failed::Invalid or missing API key. Set the BOIDWATCH_API_KEY secret. $detail"
+            exit 3
+            ;;
+          4)
+            echo "::error title=Boidwatch out of credits::Insufficient credits for this run. Top up at https://app.boidwatch.com/billing. $detail"
+            exit 4
+            ;;
+          5)
+            echo "::error title=Boidwatch resource not found::$detail"
+            exit 5
+            ;;
+          6)
+            echo "::error title=Boidwatch request conflict::$detail"
+            exit 6
+            ;;
+          7)
+            echo "::error title=Boidwatch timed out::Run did not finish within $BW_WAIT_TIMEOUT. It keeps running; raise wait-timeout. $detail"
+            exit 7
+            ;;
+          8)
+            echo "::error title=Boidwatch rate-limited::Too many requests. Wait, then resume with boidwatch run results <run_id> --wait if the log shows a run_id. Only re-run this job when no run was created. $detail"
+            exit 8
+            ;;
+          130)
+            echo "::error title=Boidwatch interrupted::The job was cancelled while waiting. The run keeps running. $detail"
+            exit 130
+            ;;
+          *)
+            echo "::error title=Boidwatch run failed::boidwatch exited with code $ec. $detail"
+            exit "$ec"
+            ;;
+        esac
+
+    - name: Parse results
+      id: parse
+      shell: bash
+      env:
+        BW_EXIT_CODE: ${{ steps.run.outputs.exit-code }}
+        BW_RESULTS: ${{ steps.run.outputs.results-file }}
+      run: |
+        set -euo pipefail
+        # The CLI prints the compact view (apitypes.ExplorationSummary). With
+        # assertions it wraps it as {results, assertions}.
+        normalized="$RUNNER_TEMP/boidwatch-result-body.json"
+        jq 'if type == "object" and has("results") then .results else . end' "$BW_RESULTS" > "$normalized"
+
+        schema=$(jq -r '.schema_version // empty' "$normalized" | tr -d '\n')
+        if [ "$schema" != "1" ]; then
+          echo "::warning::boidwatch printed results schema_version '$schema'; this action reads schema_version 1. Pin the version input to a matching CLI release."
+        fi
+
+        # tr -d '\n' guards $GITHUB_OUTPUT against multi-line values from the
+        # results JSON injecting extra output lines.
+        run_id=$(jq -r '.run_id // empty' "$normalized" | tr -d '\n')
+        valid_agents=$(jq -r '.metadata.valid_agents // 0' "$normalized" | tr -d '\n')
+        frustration_exits=$(jq -r '.surfaces.frustration_exits // 0' "$normalized" | tr -d '\n')
+        high_gaps=$(jq -r '[.gap_analysis.identified_gaps[]?.severity | select(ascii_downcase == "high")] | length' "$normalized")
+        # identified_gaps is severity-ranked, so its first three are the top gaps.
+        jq -c '(.gap_analysis.identified_gaps // [])[:3]' "$normalized" > "$RUNNER_TEMP/boidwatch-top-gaps.json"
+        entry_block=$(jq -r '.entry_block.message // empty' "$normalized" | tr -d '\n')
+        gap_status=$(jq -r '.summary.gap_analysis_status // empty' "$normalized" | tr -d '\n')
+
+        # Exit 0 alone is not a pass: the CLI exits 0 for a run whose gap
+        # analysis failed. An entry-blocked run exits 9 in every mode.
+        passed=true
+        if [ "$BW_EXIT_CODE" != "0" ]; then passed=false; fi
+        if [ -n "$entry_block" ]; then
+          passed=false
+          echo "::warning title=Boidwatch: no persona got past the entry URL::$entry_block"
+        fi
+        if [ "$gap_status" = "failed" ]; then
+          passed=false
+          echo "::warning title=Boidwatch gap analysis failed::design-intent was set but gap analysis produced no result. The gap counts are not a finding."
+        fi
+
+        {
+          echo "run-id=$run_id"
+          echo "valid-agents=$valid_agents"
+          echo "frustration-exits=$frustration_exits"
+          echo "high-gaps=$high_gaps"
+          echo "entry-block=$entry_block"
+          echo "gap-analysis-status=$gap_status"
+          echo "passed=$passed"
+          echo "top-gaps-file=$RUNNER_TEMP/boidwatch-top-gaps.json"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Mint share link
+      id: share
+      if: inputs.share-report == 'true' && steps.parse.outputs.run-id != ''
+      shell: bash
+      env:
+        BOIDWATCH_API_KEY: ${{ inputs.api-key }}
+        BOIDWATCH_API_URL: ${{ inputs.api-url }}
+        BW_RUN_ID: ${{ steps.parse.outputs.run-id }}
+        BW_LABEL: ${{ github.repository }}#${{ github.event.pull_request.number || github.run_number }}
+      run: |
+        set -euo pipefail
+        # 30-day expiry keeps PR history reviewable without leaving links open forever.
+        body=$(jq -n --arg label "$BW_LABEL" '{expires_in_seconds: 2592000, label: $label}')
+        resp=$(curl -fsS -X POST \
+          -H "Authorization: Bearer $BOIDWATCH_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d "$body" \
+          "$BOIDWATCH_API_URL/v1/runs/$BW_RUN_ID/share-links" || true)
+        report_url=$(printf '%s' "$resp" | jq -r '.data.url // .data.share_url // empty' 2>/dev/null | tr -d '\n' || true)
+        if [ -z "$report_url" ]; then
+          echo "::warning::Could not mint a share link for run $BW_RUN_ID; the PR comment will omit the report URL."
+        fi
+        echo "report-url=$report_url" >> "$GITHUB_OUTPUT"
+
+    - name: Post sticky PR comment
+      if: github.event_name == 'pull_request' && steps.parse.outputs.run-id != ''
+      uses: actions/github-script@v7
+      env:
+        BW_RUN_ID: ${{ steps.parse.outputs.run-id }}
+        BW_REPORT_URL: ${{ steps.share.outputs.report-url }}
+        BW_HIGH_GAPS: ${{ steps.parse.outputs.high-gaps }}
+        BW_VALID_AGENTS: ${{ steps.parse.outputs.valid-agents }}
+        BW_FRUSTRATION_EXITS: ${{ steps.parse.outputs.frustration-exits }}
+        BW_PASSED: ${{ steps.parse.outputs.passed }}
+        BW_ENTRY_BLOCK: ${{ steps.parse.outputs.entry-block }}
+        BW_GAP_STATUS: ${{ steps.parse.outputs.gap-analysis-status }}
+        BW_MODE: ${{ inputs.mode }}
+        BW_URL: ${{ inputs.url }}
+        BW_TOP_GAPS_FILE: ${{ steps.parse.outputs.top-gaps-file }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require('fs');
+          const marker = '<!-- boidwatch-report -->';
+          // Neutralize semi-untrusted text (LLM-generated gap fields, inputs)
+          // before it lands in a trusted bot comment: collapse newlines, then
+          // escape markdown-active characters so links/images/HTML stay inert.
+          const esc = s => String(s ?? '')
+            .replace(/\r?\n/g, ' ')
+            .replace(/[\\\[\]!<`|]/g, m => '\\' + m);
+          let gaps = [];
+          try {
+            gaps = JSON.parse(fs.readFileSync(process.env.BW_TOP_GAPS_FILE, 'utf8'));
+          } catch (e) { /* no gaps file — leave empty */ }
+
+          const status = process.env.BW_MODE === 'gate'
+            ? (process.env.BW_PASSED === 'true' ? 'Passed' : 'Failed')
+            : 'Informational';
+
+          const entryBlock = process.env.BW_ENTRY_BLOCK || '';
+          const gapFailed = process.env.BW_GAP_STATUS === 'failed';
+          const warnings = [];
+          if (entryBlock) warnings.push(`**No persona got past the entry URL:** ${esc(entryBlock)}`);
+          if (gapFailed) warnings.push('**Gap analysis failed:** design-intent was set but no gap analysis came back, so the gap counts below are not a finding.');
+          const warningLines = warnings.flatMap(w => ['', w]);
+
+          const rows = gaps.length
+            ? gaps.map(g => `| ${esc(g.severity) || '—'} | ${esc(g.category) || '—'} | ${esc(g.description)} |`).join('\n')
+            : `| — | — | ${entryBlock ? 'Not evaluated' : 'No gaps surfaced'} |`;
+
+          // Link target: strip anything that could close the () or smuggle markup.
+          const reportUrl = (process.env.BW_REPORT_URL || '').replace(/[\s<>()\\`]/g, '');
+          const reportLine = reportUrl
+            ? `\n[View the full report](${reportUrl})\n`
+            : '';
+
+          // Rendered in a code span — strip backticks so it can't break out.
+          const runId = String(process.env.BW_RUN_ID || '').replace(/`/g, '');
+
+          const body = [
+            marker,
+            `### Boidwatch UX check — ${status}`,
+            '',
+            `Explored ${esc(process.env.BW_URL)} — run \`${runId}\``,
+            ...warningLines,
+            '',
+            `| High-severity gaps | Valid agents | Frustration exits |`,
+            `| --- | --- | --- |`,
+            `| ${esc(process.env.BW_HIGH_GAPS)} | ${esc(process.env.BW_VALID_AGENTS)} | ${esc(process.env.BW_FRUSTRATION_EXITS)} |`,
+            '',
+            '**Top gaps**',
+            '',
+            '| Severity | Category | Description |',
+            '| --- | --- | --- |',
+            rows,
+            reportLine,
+          ].join('\n');
+
+          const { owner, repo } = context.repo;
+          const issue_number = context.payload.pull_request.number;
+          const comments = await github.paginate(github.rest.issues.listComments, {
+            owner, repo, issue_number, per_page: 100,
+          });
+          const existing = comments.find(c => c.body && c.body.includes(marker));
+          if (existing) {
+            await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+          } else {
+            await github.rest.issues.createComment({ owner, repo, issue_number, body });
+          }
+
+    - name: Enforce gate
+      if: inputs.mode == 'gate'
+      shell: bash
+      env:
+        BW_EXIT_CODE: ${{ steps.run.outputs.exit-code }}
+        BW_HIGH_GAPS: ${{ steps.parse.outputs.high-gaps }}
+        BW_VALID_AGENTS: ${{ steps.parse.outputs.valid-agents }}
+        BW_PASSED: ${{ steps.parse.outputs.passed }}
+        BW_ENTRY_BLOCK: ${{ steps.parse.outputs.entry-block }}
+        BW_GAP_STATUS: ${{ steps.parse.outputs.gap-analysis-status }}
+      run: |
+        set -euo pipefail
+        # An entry-blocked run also exits 9, so name the entry block first.
+        if [ -n "$BW_ENTRY_BLOCK" ]; then
+          echo "::error title=Boidwatch gate failed::No persona got past the entry URL: $BW_ENTRY_BLOCK"
+          exit 1
+        fi
+        if [ "$BW_EXIT_CODE" = "9" ]; then
+          echo "::error title=Boidwatch gate failed::Assertions failed (high-severity gaps: $BW_HIGH_GAPS, valid agents: $BW_VALID_AGENTS). See the PR comment for the full report."
+          exit 1
+        fi
+        if [ "$BW_PASSED" != "true" ]; then
+          if [ "$BW_GAP_STATUS" = "failed" ]; then
+            echo "::error title=Boidwatch gate failed::Gap analysis failed (gap_analysis_status: failed), so the run cannot show the page meets the design intent."
+          else
+            echo "::error title=Boidwatch gate failed::The run did not pass. See the PR comment for the full report."
+          fi
+          exit 1
+        fi
